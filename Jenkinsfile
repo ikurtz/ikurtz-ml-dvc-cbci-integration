@@ -1,116 +1,101 @@
-/* groovylint-disable CompileStatic, DuplicateMapLiteral, DuplicateStringLiteral, LineLength, NestedBlockDepth */
 pipeline {
-    agent any
-    environment {
-        JENKINS_USER_NAME = 'JenkinsRPPP'
-        JENKINS_EMAIL = 'jenkins@rppp.com'
-        GIT_REPO = 'dagshub.com/puneethp/RPPP'
-        GIT_COMMIT_REV = sh(returnStdout: true, script: 'git rev-parse --short HEAD').trim()
+  agent {
+    kubernetes {
+      label 'my-kubernetes-label'
+      defaultContainer 'jnlp'
+      yaml """
+        apiVersion: v1
+        kind: Pod
+        metadata:
+          labels:
+            my-kubernetes-label: true
+        spec:
+          containers:
+            - name: cml-dvc
+              image: ghcr.io/iterative/cml:0-dvc2-base1
+              command: ['cat']
+              tty: true
+          """
     }
-    stages {
-        stage('Run inside Docker Image') {
-            agent {
-                dockerfile {
-                    additionalBuildArgs  '--tag rppp:$BRANCH_NAME'
-                    args '-v $WORKSPACE:/project -w /project -v /extras:/extras -e PYTHONPATH=/project'
-                }
-            }
-            stages {
-                stage('Run Unit Test') {
-                    steps {
-                        sh 'pytest -vvrxXs'
-                    }
-                }
-                stage('Run Linting') {
-                    steps {
-                        sh '''
-                            flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
-                            flake8 . --count --max-complexity=10 --max-line-length=127 --statistics
-                            black . --check --diff
-                        '''
-                    }
-                }
-                stage('Setup DVC Creds') {
-                    steps {
-                        withCredentials(
-                            [
-                                usernamePassword(
-                                    credentialsId: 'PASSWORD',
-                                    passwordVariable: 'PASSWORD',
-                                    usernameVariable: 'USER_NAME'),
-                            ]
-                        ) {
-                            sh '''
-                                dvc remote modify origin --local auth basic
-                                dvc remote modify origin --local user $USER_NAME
-                                dvc remote modify origin --local password $PASSWORD
-                                dvc status -r origin
-                            '''
-                        }
-                    }
-                }
-                stage('Sync DVC Remotes') {
-                    steps {
-                        sh '''
-                            dvc status
-                            dvc status -r jenkins_local
-                            dvc status -r origin
-                            dvc pull -r jenkins_local || echo 'Some files are missing in local cache!'
-                            dvc pull -r origin
-                            dvc push -r jenkins_local
-                        '''
-                    }
-                }
-                stage('Update DVC Pipeline') {
-                    when { changeRequest() }
-                    steps {
-                        sh '''
-                            dvc repro --dry -mP
-                            dvc repro -mP
-                            git branch -a
-                            cat dvc.lock
-                            dvc push -r jenkins_local
-                            dvc push -r origin
-                        '''
-                        sh 'dvc metrics diff --show-md --precision 2 $CHANGE_TARGET'
-                    }
-                }
-                stage('Commit back results') {
-                    when { changeRequest() }
-                    steps {
-                        withCredentials(
-                            [
-                                usernamePassword(
-                                    credentialsId: 'GIT_PAT',
-                                    passwordVariable: 'GIT_PAT',
-                                    usernameVariable: 'GIT_USER_NAME'),
-                            ]
-                        ) {
-                            sh '''
-                                git branch -a
-                                git status
-                                if ! git diff --exit-code dvc.lock; then
-                                    git add .
-                                    git status
-                                    git config --local user.email $JENKINS_EMAIL
-                                    git config --local user.name $JENKINS_USER_NAME
-                                    git commit -m "$GIT_COMMIT_REV: Update dvc.lock and metrics"
-                                    git push https://$GIT_USER_NAME:$GIT_PAT@$GIT_REPO HEAD:$CHANGE_BRANCH
-                                else
-                                    echo 'Nothing to Commit!'
-                                fi
-                            '''
-                        }
-                    }
-                }
-            }
-            post {
-                always {
-                    sh '''
-                        rm -r .dvc/config.local || echo 'Config not found! Nothing to worry about!'
-                    '''
-                }
-            }
+  }
+  
+  stages {
+    stage('Checkout') {
+      steps {
+        checkout scm
+      }
+    }
+    
+    stage('Setup Python') {
+      steps {
+        container('cml-dvc') {
+          tool 'Python 3.x'
         }
+      }
     }
+    
+    stage('Setup CML') {
+      steps {
+        container('cml-dvc') {
+          sh 'cml-runner.py setup'
+        }
+      }
+    }
+    
+    stage('Setup DVC') {
+      steps {
+        container('cml-dvc') {
+          sh 'dvc init --no-scm'
+          sh 'dvc remote add -d storage s3://your-bucket/path'
+          sh 'dvc remote modify storage credentialpath /app/.aws/credentials'
+        }
+      }
+    }
+    
+    stage('Train model') {
+      environment {
+        AWS_ACCESS_KEY_ID = credentials('AWS_ACCESS_KEY_ID')
+        AWS_SECRET_ACCESS_KEY = credentials('AWS_SECRET_ACCESS_KEY')
+      }
+      steps {
+        container('cml-dvc') {
+          sh 'pip install -r requirements.txt'
+          sh 'dvc pull data --run-cache'
+          sh 'dvc repro'
+        }
+      }
+    }
+    
+    stage('Create CML report') {
+      environment {
+        REPO_TOKEN = credentials('GITHUB_TOKEN')
+      }
+      steps {
+        container('cml-dvc') {
+          sh 'echo "## Metrics: workflow vs. main" >> report.md'
+          sh 'git fetch --depth=1 origin main:main'
+        
+          sh 'dvc metrics diff master --show-md >> report.md'
+          sh 'echo "## Plots" >> report.md'
+          sh 'echo "### Class confusions" >> report.md'
+          sh 'dvc plots diff --target classes.csv --template confusion -x actual -y predicted --show-vega master > vega.json'
+          sh 'vl2png vega.json -s 1.5 > plot.png'
+          sh 'echo \'![](./plot.png "Confusion Matrix")\' >> report.md'
+        
+          sh 'echo "### Effects of regularization" >> report.md'
+          sh 'dvc plots diff --target estimators.csv -x Regularization --show-vega master > vega.json'
+          sh 'vl2png vega.json -s 1.5 > plot-diff.png'
+          sh 'echo \'![](./plot-diff.png)\' >> report.md'
+        
+          sh 'echo "### Training loss" >> report.md'
+          sh 'dvc plots diff --target loss.csv --show-vega main > vega.json'
+          sh 'vl2png vega.json > plot-loss.png'
+          sh 'echo \'![](./plot-loss.png "Training Loss")\' >> report.md'
+        
+          sh 'cml comment create report.md'
+        }
+      }
+    }
+  }
 }
+
