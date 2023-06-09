@@ -2,7 +2,7 @@ pipeline {
   agent {
     kubernetes {
       label 'my-kubernetes-label'
-      defaultContainer 'jnlp'
+      defaultContainer 'default-jnlp'
       yaml """
         apiVersion: v1
         kind: Pod
@@ -12,7 +12,7 @@ pipeline {
         spec:
           containers:
             - name: cml-dvc
-              image: ghcr.io/iterative/cml:0-dvc2-base1
+              image: 268150017804.dkr.ecr.us-east-1.amazonaws.com/cbci-aws-workshop-registry/cml:0-dvc2-base1
               command: ['cat']
               tty: true
           """
@@ -68,7 +68,7 @@ pipeline {
     
     stage('Create CML report') {
       environment {
-        REPO_TOKEN = credentials('GITHUB_TOKEN')
+        REPO_TOKEN = credentials('ikurtz-gh-pat')
       }
       steps {
         container('cml-dvc') {
